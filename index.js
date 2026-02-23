@@ -1,12 +1,12 @@
 /**
  * eslint-plugin-comment-cleaner
- * ESLint plugin to detect commented-out code in your codebase.
+ * ESLint plugin to detect and auto-fix commented-out code.
  * Uses the same smart detection logic as the comment-cleaner CLI.
  */
 
 "use strict";
 
-// ─── Code detection heuristics (same as CLI) ─────────────────────────────────
+// ─── Code detection heuristics ───────────────────────────────────────────────
 const CODE_SIGNALS = [
   /\b(const|let|var)\s+\w+\s*[=:({;]/,
   /\bfunction\s+\w+\s*\(/,
@@ -61,12 +61,23 @@ const PROSE_SIGNALS = [
   /^[A-Z][^{};]+$/,
 ];
 
+// ─── Import patterns ──────────────────────────────────────────────────────────
+const IMPORT_PATTERNS = [
+  /^import\s+.+\s+from\s+['"`]/,
+  /^import\s*{/,
+  /^import\s+['"`]/,
+  /^import\s+\w+\s*,/,
+  /^import\s+\*\s+as\s+\w+/,
+  /^require\s*\(/,
+  /^const\s+\w+\s*=\s*require\s*\(/,
+  /^import\s+type\s+/,
+];
+
 const MULTI_LINE_THRESHOLD = 2;
 
 function looksLikeCode(text) {
   const t = text.trim();
   if (!t || t.length < 5) return false;
-  // @keep annotation — always skip
   if (/@keep\b/i.test(t)) return false;
   for (const p of PROSE_SIGNALS) if (p.test(t)) return false;
   let score = 0;
@@ -75,7 +86,6 @@ function looksLikeCode(text) {
 }
 
 function looksLikeCodeBlock(lines) {
-  // @keep annotation anywhere in block — skip
   if (lines.some(l => /@keep\b/i.test(l))) return false;
   const combined = lines.map(l => l.trim()).join(" ");
   if (!combined || combined.length < 10) return false;
@@ -88,16 +98,54 @@ function looksLikeCodeBlock(lines) {
   return score >= MULTI_LINE_THRESHOLD;
 }
 
+function looksLikeImport(text) {
+  const t = text.trim();
+  if (!t) return false;
+  if (/@keep\b/i.test(t)) return false;
+  return IMPORT_PATTERNS.some(p => p.test(t));
+}
+
 function getSeverityLabel(lineCount) {
   if (lineCount >= 10) return "high (10+ lines)";
-  if (lineCount >= 4)  return "medium (4-9 lines)";
+  if (lineCount >= 4) return "medium (4-9 lines)";
   return "low (1-3 lines)";
 }
 
-// ─── The ESLint rule ──────────────────────────────────────────────────────────
+// ─── Helper: build a fixer that removes a comment node + its line ─────────────
+function makeLineFixer(fixer, sourceCode, comment) {
+  const src = sourceCode.getText();
+  const start = comment.range[0];
+  const end = comment.range[1];
+
+  // Expand range to include leading whitespace on the line
+  let rangeStart = start;
+  while (rangeStart > 0 && src[rangeStart - 1] !== "\n") rangeStart--;
+
+  // Expand range to include the trailing newline
+  let rangeEnd = end;
+  if (src[rangeEnd] === "\n") rangeEnd++;
+
+  return fixer.removeRange([rangeStart, rangeEnd]);
+}
+
+function makeRangeFixer(fixer, sourceCode, firstComment, lastComment) {
+  const src = sourceCode.getText();
+  let rangeStart = firstComment.range[0];
+  let rangeEnd = lastComment.range[1];
+
+  // Include leading whitespace
+  while (rangeStart > 0 && src[rangeStart - 1] !== "\n") rangeStart--;
+  // Include trailing newline
+  if (src[rangeEnd] === "\n") rangeEnd++;
+
+  return fixer.removeRange([rangeStart, rangeEnd]);
+}
+
+// ─── Rule: no-commented-code (with auto-fix) ──────────────────────────────────
 const noCommentedCode = {
   meta: {
     type: "suggestion",
+    fixable: "code",
     docs: {
       description: "Disallow commented-out code",
       category: "Best Practices",
@@ -112,11 +160,6 @@ const noCommentedCode = {
       {
         type: "object",
         properties: {
-          severity: {
-            type: "string",
-            enum: ["error", "warn"],
-            default: "warn",
-          },
           ignorePatterns: {
             type: "array",
             items: { type: "string" },
@@ -129,48 +172,44 @@ const noCommentedCode = {
   },
 
   create(context) {
-    const options       = context.options[0] || {};
+    const options = context.options[0] || {};
     const ignorePatterns = (options.ignorePatterns || []).map(p => new RegExp(p));
-    const sourceCode    = context.getSourceCode ? context.getSourceCode() : context.sourceCode;
+    const sourceCode = context.getSourceCode ? context.getSourceCode() : context.sourceCode;
 
     function isIgnored(text) {
       return ignorePatterns.some(p => p.test(text));
     }
 
-    function reportBlock(node, lines) {
-      const lineCount = lines.length;
-      const severity  = getSeverityLabel(lineCount);
-      context.report({
-        node,
-        messageId: "commentedCode",
-        data: { severity },
-      });
-    }
-
     return {
       Program() {
         const comments = sourceCode.getAllComments();
-
         let i = 0;
+
         while (i < comments.length) {
           const comment = comments[i];
 
-          // ── Block comment /* ... */ ────────────────────────────────────────
+          // ── Block comment /* ... */ ──────────────────────────────────────
           if (comment.type === "Block") {
-            const raw   = comment.value;
+            const raw = comment.value;
             const lines = raw.split("\n").map(l => l.replace(/^[\s*]+/, "").trim()).filter(Boolean);
 
             if (!isIgnored(raw) && looksLikeCodeBlock(lines)) {
-              reportBlock(comment, lines);
+              context.report({
+                node: comment,
+                messageId: "commentedCode",
+                data: { severity: getSeverityLabel(lines.length) },
+                fix(fixer) {
+                  return makeLineFixer(fixer, sourceCode, comment);
+                },
+              });
             }
             i++;
             continue;
           }
 
-          // ── Line comment // ────────────────────────────────────────────────
+          // ── Line comment // ──────────────────────────────────────────────
           if (comment.type === "Line") {
             const text = comment.value.trim();
-
             if (isIgnored(text) || !looksLikeCode(text)) { i++; continue; }
 
             // Collect consecutive line comments that are also code
@@ -192,9 +231,114 @@ const noCommentedCode = {
               break;
             }
 
-            reportBlock(group[0], group.map(c => c.value.trim()));
+            const firstComment = group[0];
+            const lastComment = group[group.length - 1];
+
+            context.report({
+              node: firstComment,
+              messageId: "commentedCode",
+              data: { severity: getSeverityLabel(group.length) },
+              fix(fixer) {
+                return makeRangeFixer(fixer, sourceCode, firstComment, lastComment);
+              },
+            });
+
             i = j;
             continue;
+          }
+
+          i++;
+        }
+      },
+    };
+  },
+};
+
+// ─── Rule: no-commented-imports (with auto-fix) ───────────────────────────────
+const noCommentedImports = {
+  meta: {
+    type: "suggestion",
+    fixable: "code",
+    docs: {
+      description: "Disallow commented-out import and require statements",
+      category: "Best Practices",
+      recommended: true,
+      url: "https://github.com/Youngemmy5956/eslint-plugin-comment-cleaner",
+    },
+    messages: {
+      commentedImport:
+        "Commented-out import detected. Remove it or add @keep to suppress.",
+    },
+    schema: [],
+  },
+
+  create(context) {
+    const sourceCode = context.getSourceCode ? context.getSourceCode() : context.sourceCode;
+
+    return {
+      Program() {
+        const comments = sourceCode.getAllComments();
+        let i = 0;
+
+        while (i < comments.length) {
+          const comment = comments[i];
+
+          // ── Block comment with import ────────────────────────────────────
+          if (comment.type === "Block") {
+            const raw = comment.value;
+            const lines = raw.split("\n").map(l => l.replace(/^[\s*]+/, "").trim()).filter(Boolean);
+            if (lines.some(l => looksLikeImport(l))) {
+              context.report({
+                node: comment,
+                messageId: "commentedImport",
+                fix(fixer) {
+                  return makeLineFixer(fixer, sourceCode, comment);
+                },
+              });
+            }
+            i++;
+            continue;
+          }
+
+          // ── Line comment with import ─────────────────────────────────────
+          if (comment.type === "Line") {
+            const text = comment.value.trim();
+            if (/@keep\b/i.test(text)) { i++; continue; }
+
+            if (looksLikeImport(text)) {
+              // Collect consecutive import comments
+              const group = [comment];
+              let j = i + 1;
+              while (j < comments.length) {
+                const next = comments[j];
+                if (
+                  next.type === "Line" &&
+                  next.loc.start.line === comments[j - 1].loc.start.line + 1
+                ) {
+                  const nextText = next.value.trim();
+                  if (looksLikeImport(nextText) && !/@keep\b/i.test(nextText)) {
+                    group.push(next);
+                    j++;
+                    continue;
+                  }
+                }
+                break;
+              }
+
+              const firstComment = group[0];
+              const lastComment = group[group.length - 1];
+
+              context.report({
+                node: firstComment,
+                messageId: "commentedImport",
+                fix(fixer) {
+                  return makeRangeFixer(fixer, sourceCode, firstComment, lastComment);
+                },
+              });
+
+              i = j;
+              continue;
+            }
           }
 
           i++;
@@ -208,31 +352,37 @@ const noCommentedCode = {
 module.exports = {
   meta: {
     name: "eslint-plugin-comment-cleaner",
-    version: "1.0.0",
+    version: "1.1.0",
   },
 
   rules: {
     "no-commented-code": noCommentedCode,
+    "no-commented-imports": noCommentedImports,
   },
 
-  // Recommended config for ESLint v8 (legacy)
   configs: {
+    // ESLint v8 legacy config
     recommended: {
       plugins: ["comment-cleaner"],
       rules: {
         "comment-cleaner/no-commented-code": "warn",
+        "comment-cleaner/no-commented-imports": "warn",
       },
     },
 
-    // Flat config for ESLint v9+
+    // ESLint v9 flat config
     "flat/recommended": {
       plugins: {
         "comment-cleaner": {
-          rules: { "no-commented-code": noCommentedCode },
+          rules: {
+            "no-commented-code": noCommentedCode,
+            "no-commented-imports": noCommentedImports,
+          },
         },
       },
       rules: {
         "comment-cleaner/no-commented-code": "warn",
+        "comment-cleaner/no-commented-imports": "warn",
       },
     },
   },
